@@ -1,3 +1,7 @@
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
 """程序入口:启动财报问答助手"""
 from dotenv import load_dotenv
 import rag_pipeline
