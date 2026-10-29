@@ -56,3 +56,8 @@ INTENT_KEYWORDS = {
     "business": ["product", "business", "operation", "factory", "产品", "业务", "工厂"],
     "governance": ["director", "executive", "compensation", "董事", "高管", "薪酬"],
 }
+
+# 软加权：相关章节在重排时加分，不排除其他章节
+SECTION_BOOST = 0.08   # 加分幅度，可调
+# 结构化表格数据库
+TABLE_DB_PATH = "financial_data.db"

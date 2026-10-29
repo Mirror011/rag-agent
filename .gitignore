@@ -16,3 +16,4 @@ __pycache__/
 
 # 数据文件（PDF 较大，可选是否忽略）
 # data/
+financial_data.db

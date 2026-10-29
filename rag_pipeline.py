@@ -9,6 +9,7 @@ from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from sentence_transformers import CrossEncoder
+import table_db
 
 import config
 
@@ -164,42 +165,88 @@ def detect_section_type(question):
             return stype
     return None
 
+# 常见财务科目关键词 → 数据库查询词
+FIN_KEYWORDS = {
+    "营收": "total revenues", "总营收": "total revenues", "revenue": "revenues",
+    "净利润": "net income", "net income": "net income",
+    "毛利": "gross profit", "gross profit": "gross profit",
+    "成本": "cost of revenues", "cost": "cost of revenues",
+    "研发": "research and development", "r&d": "research and development",
+    "汽车": "automotive", "automotive": "automotive",
+    "能源": "energy", "energy": "energy",
+    "服务": "services", "services": "services",
+    "现金": "cash", "cash": "cash",
+}
+
+
+def lookup_structured(question):
+    """从问题中识别财务科目，查结构化库，返回精确数据"""
+    q = question.lower()
+    hits = []
+    for kw, dbterm in FIN_KEYWORDS.items():
+        if kw.lower() in q:
+            hits.append(dbterm)
+    if not hits:
+        return ""
+
+    rows = []
+    for term in dict.fromkeys(hits):      # 去重保序
+        rows.extend(table_db.query_trend(term, limit=12))
+    return table_db.format_results(rows[:40])
 
 def ask(vectorstore, llm, question):
-    """检索 + 重排 + 生成"""
+    """检索 + 重排（含章节软加权）+ 生成"""
     stype = detect_section_type(question)
-    flt = {"section_type": stype} if stype else None
     if stype:
-        print(f"[检索范围] 已限定为 {stype} 类章节")
+        print(f"[章节偏好] {stype} 类章节将在重排时加权（不排除其他章节）")
 
     if config.USE_RERANK:
-        candidates = vectorstore.similarity_search(
-            question, k=config.RETRIEVE_TOP_K, filter=flt
-        )
+        # 关键改动：不再传 filter，全范围召回
+        candidates = vectorstore.similarity_search(question, k=config.RETRIEVE_TOP_K)
+        print(f"[召回候选章节] {[d.metadata.get('section') for d in candidates]}")
         reranker = get_reranker()
         pairs = [[question, doc.page_content] for doc in candidates]
         scores = reranker.predict(pairs)
-        scored = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-        retrieved_docs = [doc for _, doc in scored[:config.RERANK_TOP_K]]
-    else:
-        retrieved_docs = vectorstore.similarity_search(
-            question, k=config.RERANK_TOP_K, filter=flt
-        )
 
-    # 组装上下文，并带上出处（引用溯源）
+        # 软加权：相关章节的候选加分，但不剔除其他章节
+        adjusted = []
+        for score, doc in zip(scores, candidates):
+            if stype and doc.metadata.get("section_type") == stype:
+                score = score + config.SECTION_BOOST
+            adjusted.append((score, doc))
+
+        adjusted.sort(key=lambda x: x[0], reverse=True)
+        retrieved_docs = [doc for _, doc in adjusted[:config.RERANK_TOP_K]]
+    else:
+        retrieved_docs = vectorstore.similarity_search(question, k=config.RERANK_TOP_K)
+
+    # 组装上下文，带出处
     parts = []
     for d in retrieved_docs:
         src = f"[来源：{d.metadata.get('section','?')}，第 {d.metadata.get('page','?')} 页]"
         parts.append(f"{src}\n{d.page_content}")
     context = "\n\n".join(parts)
 
+    # 新增：结构化财务数据（精确数值，优先级高于文本块）
+    structured = lookup_structured(question)
+    if structured:
+        print("[结构化查询] 命中财务科目，已注入精确数据")
+        context = structured + "\n\n" + context
+
+    # 打印实际用了哪些章节，方便验证
+    used = [d.metadata.get("section", "?") for d in retrieved_docs]
+    print(f"[实际使用章节] {used}")
+
     prompt = ChatPromptTemplate.from_template(
         """你是一个财报分析助手。请根据下面提供的财报内容回答问题。
+
+如果内容中包含"[结构化财务数据]"部分，请优先使用其中的数字，因为它们是从财报表格中
+精确提取的，年份与科目对应关系可靠；文本部分仅作为补充说明。
+
 请确保回答完全基于这些内容，并在答案末尾标注依据的来源（章节与页码）。
+如果问题需要计算（如增长率、占比、差额），可以基于上述数字进行计算并写出计算过程。
 如果内容里找不到答案，就直接说"根据提供的财报内容，无法回答此问题"。
-如果问题需要计算（如增长率、占比、差额），你可以基于财报中检索到的数字进行计算，
-并在答案中写出计算过程。但计算所用的每个原始数字都必须来自上面提供的财报内容，
-不得使用财报之外的数字。
+
 财报内容:
 {context}
 
