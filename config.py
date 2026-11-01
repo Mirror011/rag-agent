@@ -4,8 +4,12 @@ import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"  # 顺便关掉那个警告
 
-# 数据与存储路径
-PDF_PATH = "data/tsla-20251231.pdf"
+# 数据与存储路径（多公司）
+DOCUMENTS = [
+    {"path": "data/tsla-20251231.pdf", "company": "Tesla", "year": 2025},
+    {"path": "data/apple-2025.pdf",    "company": "Apple", "year": 2025},
+]
+PDF_PATH = DOCUMENTS[0]["path"]      # 兼容旧代码
 PERSIST_DIR = "chroma_db"
 
 # 分块参数
@@ -30,9 +34,8 @@ RETRIEVE_TOP_K = 20                            # 第1段：向量检索粗筛的
 RERANK_TOP_K = 5                               # 第2段：重排后最终保留的数量
 
 # ===== 元数据配置 =====
-# 文档基本信息（后续支持多公司时改为按文件配置）
-DOC_COMPANY = "Tesla"
-DOC_FISCAL_YEAR = 2025
+DOC_COMPANY = DOCUMENTS[0]["company"]        # 兼容旧代码
+DOC_FISCAL_YEAR = DOCUMENTS[0]["year"]
 DOC_TYPE = "10-K"
 
 # SEC 法定章节 → 语义分类映射

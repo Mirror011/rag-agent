@@ -13,11 +13,12 @@ import table_db
 
 import config
 
+
+# ============ 文档解析 ============
+
 def parse_sections(pages):
     """
     识别 10-K 的章节边界。
-    依据：正文章节标题为全大写（如 ITEM 7. MANAGEMENT'S...），
-    目录页为首字母大写（Item 7.），据此过滤目录与正文中的法条引用。
     返回 [(字符起始位置, ITEM编号, 标题), ...]
     """
     full_text = ""
@@ -26,18 +27,22 @@ def parse_sections(pages):
         page_offsets.append((len(full_text), pno))
         full_text += text
 
-    # 必须全大写 + ITEM + 编号 + 点，且后面跟着标题文字（排除 "Item 408(a)" 这类引用）
-    pattern = re.compile(r"^(ITEM\s+(\d+[A-C]?))\.\s+([A-Z][A-Z\s,’'\-&\.\(\)\[\]/]{4,})$", re.MULTILINE)
+    # 兼容两种排版：
+    #   特斯拉 ITEM 7. MANAGEMENT'S...（全大写）
+    #   苹果   Item 7.\xa0\xa0Management's...（首字母大写 + 不间断空格）
+    norm_text = full_text.replace("\xa0", " ")
+    pattern = re.compile(
+        r"^(ITEM|Item)\s+(\d+[A-C]?)\.\s+([A-Za-z][A-Za-z\s,’'\-&\.\(\)\[\]/]{4,})$",
+        re.MULTILINE)
 
     sections = []
-    for m in pattern.finditer(full_text):
-        item_no = "ITEM " + m.group(2)
+    for m in pattern.finditer(norm_text):
+        item_no = "ITEM " + m.group(2).upper()
         title = m.group(3).strip()
         sections.append((m.start(), item_no, title))
 
-    print(f"识别到 {len(sections)} 个正文章节")
+    print(f"    识别到 {len(sections)} 个正文章节")
     return sections, full_text, page_offsets
-
 
 def locate(pos, sections, page_offsets):
     """给定字符位置，返回它属于哪个章节、哪一页"""
@@ -55,21 +60,70 @@ def locate(pos, sections, page_offsets):
             break
     return section, title, page
 
+
 def load_pdf(pdf_path):
-    """解析 PDF，返回 [(页码, 该页文字), ...]"""
-    print(f"正在解析 PDF:{pdf_path} ...")
+    """解析 PDF，返回 ([(页码, 文字), ...], doc 对象)
+    注意：doc 不在此关闭，需由调用方 close，供表格提取使用。"""
+    print(f"    正在解析 {pdf_path} ...")
     doc = pymupdf.open(pdf_path)
-    pages = []
-    for i, page in enumerate(doc, start=1):
-        pages.append((i, page.get_text()))
-    doc.close()
+    pages = [(i, page.get_text()) for i, page in enumerate(doc, start=1)]
     total = sum(len(t) for _, t in pages)
-    print(f"解析完成!共 {len(pages)} 页，{total} 个字符")
-    return pages
+    print(f"    共 {len(pages)} 页，{total} 个字符")
+    return pages, doc
 
 
-def split_chunks(pages):
-    """切分文本块，并为每块附加元数据"""
+# ============ 表格块提取 ============
+
+def _clean_row(row):
+    """去掉空列和纯符号列"""
+    return [c.strip() for c in row
+            if c and c.strip() not in ("", "$", "%", "(", ")")]
+
+
+def _detect_years(page_text):
+    """识别页面上的年份序列（财报通常列三年）"""
+    years, seen = [], set()
+    for y in re.findall(r"\b(20[0-3]\d)\b", page_text):
+        if y not in seen:
+            seen.add(y)
+            years.append(y)
+    return years[:3]
+
+
+def extract_tables(doc):
+    """提取表格并转为保留行列结构的 Markdown 块，返回 [(页码, 文本), ...]"""
+    table_docs = []
+    for pno in range(len(doc)):
+        page = doc[pno]
+        try:
+            tabs = page.find_tables()
+        except Exception:
+            continue
+        if not tabs.tables:
+            continue
+
+        years = _detect_years(page.get_text())
+        for tab in tabs.tables:
+            rows = [_clean_row(r) for r in tab.extract()]
+            rows = [r for r in rows if len(r) >= 2]
+            if len(rows) < 2:
+                continue
+
+            header = f"[表格] 第 {pno + 1} 页"
+            if years:
+                header += f"　列对应年份（从左到右）：{' / '.join(years)}"
+            lines = ["| " + " | ".join(r) + " |" for r in rows]
+            table_docs.append((pno + 1, header + "\n" + "\n".join(lines)))
+
+    print(f"    提取到 {len(table_docs)} 张结构化表格")
+    return table_docs
+
+
+# ============ 分块 ============
+
+def split_chunks(pages, doc=None, cfg=None):
+    """切分正文文本块，并补充保留行列结构的表格块"""
+    cfg = cfg or {"company": config.DOC_COMPANY, "year": config.DOC_FISCAL_YEAR}
     sections, full_text, page_offsets = parse_sections(pages)
 
     text_splitter = RecursiveCharacterTextSplitter(
@@ -78,77 +132,101 @@ def split_chunks(pages):
     )
     chunks = text_splitter.split_text(full_text)
 
+    def make_meta(section, title, page, ctype):
+        return {
+            "company": cfg["company"],
+            "fiscal_year": cfg["year"],
+            "doc_type": config.DOC_TYPE,
+            "section": section,
+            "section_title": title[:80],
+            "section_type": config.SECTION_TYPE_MAP.get(section, "other"),
+            "page": page,
+            "content_type": ctype,
+        }
+
     documents = []
     cursor = 0
     for chunk in chunks:
-        # 定位该块在全文中的位置
         pos = full_text.find(chunk, cursor)
         if pos == -1:
             pos = cursor
         cursor = pos + len(chunk) - config.CHUNK_OVERLAP
-
         section, title, page = locate(pos, sections, page_offsets)
         documents.append(Document(
             page_content=chunk,
-            metadata={
-                "company": config.DOC_COMPANY,
-                "fiscal_year": config.DOC_FISCAL_YEAR,
-                "doc_type": config.DOC_TYPE,
-                "section": section,
-                "section_title": title[:80],
-                "section_type": config.SECTION_TYPE_MAP.get(section, "other"),
-                "page": page,
-            }
+            metadata=make_meta(section, title, page, "text")
         ))
+    n_text = len(documents)
 
-    print(f"切分完成!共 {len(documents)} 个文本块（已附元数据）")
+    # 补充结构化表格块
+    if doc is not None:
+        page_start = {pno: off for off, pno in page_offsets}
+        for pno, content in extract_tables(doc):
+            pos = page_start.get(pno, 0)
+            section, title, _ = locate(pos, sections, page_offsets)
+            documents.append(Document(
+                page_content=content,
+                metadata=make_meta(section, title, pno, "table")
+            ))
+
+    print(f"    切分完成：{n_text} 文本块 + {len(documents) - n_text} 表格块")
     return documents
 
 
+# ============ 模型与向量库 ============
+
 def get_embeddings():
-    """加载嵌入模型"""
     return HuggingFaceEmbeddings(
         model_name=config.EMBEDDING_MODEL,
         model_kwargs={'device': 'cpu'},
         encode_kwargs={'normalize_embeddings': True}
     )
 
-# 全局缓存重排模型，避免每次提问都重新加载
+
 _reranker = None
+
 
 def get_reranker():
     """加载重排模型（CrossEncoder），只加载一次"""
     global _reranker
     if _reranker is None:
-        print("正在加载重排模型 bge-reranker（首次会下载）...")
+        print("正在加载重排模型 bge-reranker ...")
         _reranker = CrossEncoder(config.RERANK_MODEL, max_length=512)
     return _reranker
 
+
 def get_vectorstore():
-    """获取向量库：有持久化则加载，否则新建"""
+    """获取向量库：有持久化则加载，否则遍历所有公司财报新建"""
     embeddings = get_embeddings()
 
     if os.path.exists(config.PERSIST_DIR) and os.listdir(config.PERSIST_DIR):
         print("检测到已存在的向量库，直接加载...")
-        vectorstore = Chroma(
+        return Chroma(
             persist_directory=config.PERSIST_DIR,
             embedding_function=embeddings
         )
-    else:
-        print("未检测到向量库，开始新建...")
-        pages = load_pdf(config.PDF_PATH)
-        chunks = split_chunks(pages)
-        vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory=config.PERSIST_DIR
-        )
-        print("向量库已构建并保存!")
+
+    print("未检测到向量库，开始新建...")
+    chunks = []
+    for cfg in config.DOCUMENTS:
+        if not os.path.exists(cfg["path"]):
+            print(f"  跳过（文件不存在）：{cfg['path']}")
+            continue
+        print(f"  处理 {cfg['company']} ...")
+        pages, doc = load_pdf(cfg["path"])
+        chunks.extend(split_chunks(pages, doc, cfg))
+        doc.close()
+
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        persist_directory=config.PERSIST_DIR
+    )
+    print(f"向量库已构建并保存！共 {len(chunks)} 块")
     return vectorstore
 
 
 def get_llm():
-    """初始化大模型"""
     return ChatOpenAI(
         model=config.LLM_MODEL,
         temperature=config.LLM_TEMPERATURE,
@@ -157,15 +235,17 @@ def get_llm():
     )
 
 
+# ============ 查询理解 ============
+
 def detect_section_type(question):
-    """根据问题关键词推断应该检索哪类章节，判断不出则返回 None（不过滤）"""
+    """根据问题关键词推断应优先检索哪类章节"""
     q = question.lower()
     for stype, keywords in config.INTENT_KEYWORDS.items():
         if any(kw.lower() in q for kw in keywords):
             return stype
     return None
 
-# 常见财务科目关键词 → 数据库查询词
+
 FIN_KEYWORDS = {
     "营收": "total revenues", "总营收": "total revenues", "revenue": "revenues",
     "净利润": "net income", "net income": "net income",
@@ -178,18 +258,34 @@ FIN_KEYWORDS = {
     "现金": "cash", "cash": "cash",
 }
 
+COMPANY_ALIASES = {
+    "Tesla": ("特斯拉", "tesla", "tsla"),
+    "Apple": ("苹果", "apple", "aapl"),
+}
+
+
+def detect_companies(question):
+    """识别问题涉及哪些公司；未提及则返回 [None] 表示不限定"""
+    q = question.lower()
+    found = [c for c, alias in COMPANY_ALIASES.items()
+             if any(a in q for a in alias)]
+    return found or [None]
+
 
 def lookup_structured(question):
-    """从问题中识别财务科目，查结构化库"""
+    """识别财务科目与公司，从结构化库取精确数值"""
     q = question.lower()
     hits = [db for kw, db in FIN_KEYWORDS.items() if kw.lower() in q]
     if not hits:
         return ""
 
+    companies = detect_companies(question)
+
     rows = []
-    for term in dict.fromkeys(hits):
-        rows.extend(table_db.query_trend(term, limit=12))
-    out = table_db.format_results(rows[:40])
+    for comp in companies:
+        for term in dict.fromkeys(hits):
+            rows.extend(table_db.query_trend(term, company=comp, limit=12))
+    out = table_db.format_results(rows[:60])
 
     # 构成分析类问题，附加科目层级
     if any(k in q for k in ("构成", "拖累", "占比", "子项", "分项", "哪个",
@@ -207,56 +303,64 @@ def lookup_structured(question):
                 break
     return out
 
+
+# ============ 问答 ============
+
 def ask(vectorstore, llm, question):
-    """检索 + 重排（含章节软加权）+ 生成"""
+    """检索 + 重排（章节软加权 + 公司软加权）+ 生成"""
     stype = detect_section_type(question)
+    companies = [c for c in detect_companies(question) if c]
     if stype:
-        print(f"[章节偏好] {stype} 类章节将在重排时加权（不排除其他章节）")
+        print(f"[章节偏好] {stype}")
+    if companies:
+        print(f"[公司偏好] {companies}")
 
     if config.USE_RERANK:
-        # 关键改动：不再传 filter，全范围召回
-        candidates = vectorstore.similarity_search(question, k=config.RETRIEVE_TOP_K)
-        print(f"[召回候选章节] {[d.metadata.get('section') for d in candidates]}")
+        candidates = vectorstore.similarity_search(
+            question, k=config.RETRIEVE_TOP_K)
         reranker = get_reranker()
-        pairs = [[question, doc.page_content] for doc in candidates]
+        pairs = [[question, d.page_content] for d in candidates]
         scores = reranker.predict(pairs)
 
-        # 软加权：相关章节的候选加分，但不剔除其他章节
         adjusted = []
-        for score, doc in zip(scores, candidates):
-            if stype and doc.metadata.get("section_type") == stype:
-                score = score + config.SECTION_BOOST
-            adjusted.append((score, doc))
+        for score, d in zip(scores, candidates):
+            if stype and d.metadata.get("section_type") == stype:
+                score += config.SECTION_BOOST
+            # 跨公司问题：被提及的公司加权，保证双方都有机会入选
+            if companies and d.metadata.get("company") in companies:
+                score += config.SECTION_BOOST
+            adjusted.append((score, d))
 
         adjusted.sort(key=lambda x: x[0], reverse=True)
-        retrieved_docs = [doc for _, doc in adjusted[:config.RERANK_TOP_K]]
+        retrieved_docs = [d for _, d in adjusted[:config.RERANK_TOP_K]]
     else:
-        retrieved_docs = vectorstore.similarity_search(question, k=config.RERANK_TOP_K)
+        retrieved_docs = vectorstore.similarity_search(
+            question, k=config.RERANK_TOP_K)
 
-    # 组装上下文，带出处
     parts = []
     for d in retrieved_docs:
-        src = f"[来源：{d.metadata.get('section','?')}，第 {d.metadata.get('page','?')} 页]"
+        src = (f"[来源：{d.metadata.get('company','?')} "
+               f"{d.metadata.get('section','?')}，第 {d.metadata.get('page','?')} 页]")
         parts.append(f"{src}\n{d.page_content}")
     context = "\n\n".join(parts)
 
-    # 新增：结构化财务数据（精确数值，优先级高于文本块）
     structured = lookup_structured(question)
     if structured:
         print("[结构化查询] 命中财务科目，已注入精确数据")
         context = structured + "\n\n" + context
 
-    # 打印实际用了哪些章节，方便验证
-    used = [d.metadata.get("section", "?") for d in retrieved_docs]
-    print(f"[实际使用章节] {used}")
+    used = [f"{d.metadata.get('company','?')}/{d.metadata.get('section','?')}"
+            for d in retrieved_docs]
+    print(f"[实际使用] {used}")
 
     prompt = ChatPromptTemplate.from_template(
         """你是一个财报分析助手。请根据下面提供的财报内容回答问题。
 
 如果内容中包含"[结构化财务数据]"部分，请优先使用其中的数字，因为它们是从财报表格中
-精确提取的，年份与科目对应关系可靠；文本部分仅作为补充说明。
+精确提取的，公司、年份与科目的对应关系可靠；文本部分仅作为补充说明。
+涉及多家公司时，务必注意区分数据所属的公司，不要混用。
 
-请确保回答完全基于这些内容，并在答案末尾标注依据的来源（章节与页码）。
+请确保回答完全基于这些内容，并在答案末尾标注依据的来源（公司、章节与页码）。
 如果问题需要计算（如增长率、占比、差额），可以基于上述数字进行计算并写出计算过程。
 如果内容里找不到答案，就直接说"根据提供的财报内容，无法回答此问题"。
 
@@ -268,6 +372,4 @@ def ask(vectorstore, llm, question):
 回答:"""
     )
     chain = prompt | llm
-    answer = chain.invoke({"context": context, "question": question})
-    return answer.content
-
+    return chain.invoke({"context": context, "question": question}).content

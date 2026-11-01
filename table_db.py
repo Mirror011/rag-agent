@@ -33,9 +33,8 @@ def _detect_years(page_text):
     return years[:3]
 
 
-def build_db(pdf_path=None, db_path=None):
+def build_db(db_path=None):
     """从 PDF 提取表格，解析为 (科目, 年份, 数值) 存入 SQLite"""
-    pdf_path = pdf_path or config.PDF_PATH
     db_path = db_path or config.TABLE_DB_PATH
 
     if os.path.exists(db_path):
@@ -58,46 +57,50 @@ def build_db(pdf_path=None, db_path=None):
     conn.execute("CREATE INDEX idx_item ON financials(item_lower)")
     conn.execute("CREATE INDEX idx_year ON financials(year)")
 
-    doc = pymupdf.open(pdf_path)
     rows_added = 0
-
-    for pno in range(len(doc)):
-        page = doc[pno]
-        try:
-            tabs = page.find_tables()
-        except Exception:
+    for cfg in config.DOCUMENTS:
+        if not os.path.exists(cfg['path']):
+            print(f"  跳过（文件不存在）：{cfg['path']}")
             continue
-        if not tabs.tables:
-            continue
+        print(f"  解析 {cfg['company']} ...")
+        doc = pymupdf.open(cfg['path'])
+        for pno in range(len(doc)):
+            page = doc[pno]
+            try:
+                tabs = page.find_tables()
+            except Exception:
+                continue
+            if not tabs.tables:
+                continue
 
-        years = _detect_years(page.get_text())
-        if not years:
-            continue
+            years = _detect_years(page.get_text())
+            if not years:
+                continue
 
-        for ti, tab in enumerate(tabs.tables):
-            table_id = f"p{pno + 1}t{ti + 1}"
-            for row_idx, raw in enumerate(tab.extract()):
-                cells = _clean(raw)
-                if len(cells) < 2:
-                    continue
-                item = cells[0]
-                if not re.search(r"[A-Za-z]{3,}", item):
-                    continue
-                item = " ".join(item.split())  # 顺手修复换行截断
-                nums = [_to_number(c) for c in cells[1:]]
-                nums = [n for n in nums if n is not None]
-                if not nums:
-                    continue
-                for i, year in enumerate(years):
-                    if i < len(nums):
-                        conn.execute(
-                            "INSERT INTO financials VALUES (?,?,?,?,?,?,?,?,?)",
-                            (config.DOC_COMPANY, item, item.lower(), year, nums[i],
-                             pno + 1, table_id, row_idx, " | ".join(cells[:6]))
-                        )
-                        rows_added += 1
+            for ti, tab in enumerate(tabs.tables):
+                table_id = f"{cfg['company'][:4]}_p{pno + 1}t{ti + 1}"
+                for row_idx, raw in enumerate(tab.extract()):
+                    cells = _clean(raw)
+                    if len(cells) < 2:
+                        continue
+                    item = cells[0]
+                    if not re.search(r"[A-Za-z]{3,}", item):
+                        continue
+                    item = " ".join(item.split())  # 顺手修复换行截断
+                    nums = [_to_number(c) for c in cells[1:]]
+                    nums = [n for n in nums if n is not None]
+                    if not nums:
+                        continue
+                    for i, year in enumerate(years):
+                        if i < len(nums):
+                            conn.execute(
+                                "INSERT INTO financials VALUES (?,?,?,?,?,?,?,?,?)",
+                                (cfg['company'], item, item.lower(), year, nums[i],
+                                 pno + 1, table_id, row_idx, " | ".join(cells[:6]))
+                            )
+                            rows_added += 1
 
-    doc.close()
+        doc.close()
     conn.commit()
     conn.close()
     print(f"结构化数据库已建立：{rows_added} 条记录 -> {db_path}")
@@ -122,28 +125,34 @@ def query_item(keyword, year=None, limit=8):
         return c.execute(sql, args).fetchall()
 
 
-def query_trend(keyword, limit=12):
-    """查询某科目的多年数据（跨期关系的基础）"""
+def query_trend(keyword, company=None, limit=12):
+    """查询某科目的多年数据，可限定公司"""
+    sql = """SELECT item, year, value, page, company FROM financials
+             WHERE item_lower LIKE ?"""
+    args = [f"%{keyword.lower()}%"]
+    if company:
+        sql += " AND company = ?"
+        args.append(company)
+    sql += " ORDER BY company, item, year DESC LIMIT ?"
+    args.append(limit)
     with _conn() as c:
-        return c.execute(
-            """SELECT item, year, value, page FROM financials
-               WHERE item_lower LIKE ? ORDER BY item, year DESC LIMIT ?""",
-            (f"%{keyword.lower()}%", limit)
-        ).fetchall()
+        return c.execute(sql, args).fetchall()
 
 
 def format_results(rows):
-    """转成给大模型读的文本，并按 (科目,年份) 去重"""
+    """转成给大模型读的文本，按 (公司,科目,年份) 去重"""
     if not rows:
         return ""
-    seen = set()
-    lines = ["[结构化财务数据]"]
-    for item, year, value, page in rows:
-        key = (item, year)
+    seen, lines = set(), ["[结构化财务数据]"]
+    for r in rows:
+        item, year, value, page = r[0], r[1], r[2], r[3]
+        comp = r[4] if len(r) > 4 else ""
+        key = (comp, item, year)
         if key in seen:
             continue
         seen.add(key)
-        lines.append(f"{item} | {year}年 | {value:,.0f}（百万美元）| 第{page}页")
+        prefix = f"{comp} | " if comp else ""
+        lines.append(f"{prefix}{item} | {year}年 | {value:,.0f}（百万）| 第{page}页")
     return "\n".join(lines)
 
 def build_hierarchy():
