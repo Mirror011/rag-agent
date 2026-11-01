@@ -180,19 +180,32 @@ FIN_KEYWORDS = {
 
 
 def lookup_structured(question):
-    """从问题中识别财务科目，查结构化库，返回精确数据"""
+    """从问题中识别财务科目，查结构化库"""
     q = question.lower()
-    hits = []
-    for kw, dbterm in FIN_KEYWORDS.items():
-        if kw.lower() in q:
-            hits.append(dbterm)
+    hits = [db for kw, db in FIN_KEYWORDS.items() if kw.lower() in q]
     if not hits:
         return ""
 
     rows = []
-    for term in dict.fromkeys(hits):      # 去重保序
+    for term in dict.fromkeys(hits):
         rows.extend(table_db.query_trend(term, limit=12))
-    return table_db.format_results(rows[:40])
+    out = table_db.format_results(rows[:40])
+
+    # 构成分析类问题，附加科目层级
+    if any(k in q for k in ("构成", "拖累", "占比", "子项", "分项", "哪个",
+                            "breakdown", "contribut", "which")):
+        for term in dict.fromkeys(hits):
+            children = table_db.query_children(f"Total {term}")
+            if children:
+                out += "\n\n[科目构成明细]\n"
+                seen = set()
+                for item, year, value, page in children[:20]:
+                    if (item, year) in seen:
+                        continue
+                    seen.add((item, year))
+                    out += f"{item} | {year}年 | {value:,.0f} | 第{page}页\n"
+                break
+    return out
 
 def ask(vectorstore, llm, question):
     """检索 + 重排（含章节软加权）+ 生成"""
