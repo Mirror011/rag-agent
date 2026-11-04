@@ -1,19 +1,27 @@
-"""基于 LangGraph 的财报分析智能体（规划 + 工具调用 + 长短期记忆）
+"""基于 LangGraph 的财报分析智能体（MCP 工具 + 规划 + 长短期记忆）
 
-状态图结构：
+状态图：
     START → load_memory → planner → analyst ──(请求工具)──> tools ──> analyst
                                        └──────(给出答案)──> save_memory → END
 
-多智能体分工：
-    planner  规划员，判断问题复杂度；复杂问题拆解为执行计划，避免分析员
-             「走一步看一步」导致的重复与无效工具调用
-    analyst  分析员，按计划调用工具并组织答案
+工具来源（混合架构）：
+    本地工具  search_filings —— 依赖 bge-m3 与重排模型（约 2GB），
+                               若拆入子进程需重复加载，故保留在 Agent 进程内
+    MCP 工具  query_financials / get_breakdown / calculate
+                            —— 由 mcp_server.py 子进程提供，经 stdio 通信，
+                               可被任何 MCP 客户端复用
+
+多智能体：
+    planner  判断问题复杂度，复杂问题拆解为执行计划
+    analyst  按计划调用工具并组织答案
 
 记忆：
-    短期  LangGraph checkpointer，按 thread_id 保存本次会话状态
-    长期  向量检索 + SQLite 双写（见 memory.py），按 user_id 跨会话保存
+    短期  LangGraph checkpointer，按 thread_id 保存会话状态
+    长期  向量检索 + SQLite 双写（memory.py），按 user_id 跨会话保存
 """
+import os
 import re
+import sys
 import json
 import threading
 from typing import Annotated, TypedDict
@@ -29,8 +37,9 @@ try:                                    # 新旧版本 langgraph 类名不同
 except ImportError:
     from langgraph.checkpoint.memory import MemorySaver as _Saver
 
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
 import rag_pipeline
-import table_db
 import memory
 import config
 
@@ -51,14 +60,8 @@ def _vs():
     return _VS
 
 
-def warmup():
-    """启动时预热向量库与重排模型"""
-    _vs()
-    rag_pipeline.get_reranker()
-
-
 # ============================================================
-# 工具定义
+# 本地工具（依赖重模型，不走 MCP）
 # ============================================================
 
 @tool
@@ -80,54 +83,49 @@ def search_filings(query: str, company: str = "") -> str:
     return "\n\n".join(out)
 
 
-@tool
-def query_financials(item: str, company: str = "") -> str:
-    """从财报表格的结构化数据库中精确查询某财务科目的多年数值。
-    数字类问题应优先使用本工具，而非从原文中猜测。
-    item 使用英文科目名，如 "total revenues"、"net income"、"gross profit"。
-    company 可选 "Tesla" 或 "Apple"，留空则查询全部公司。"""
-    rows = table_db.query_trend(item, company=company or None, limit=15)
-    return table_db.format_results(rows) or f"未找到科目：{item}"
+LOCAL_TOOLS = [search_filings]
 
 
-@tool
-def get_breakdown(parent_item: str) -> str:
-    """查询某汇总科目由哪些子项构成及各子项数值。
-    适用于"哪个子项拖累最多""构成占比如何"这类分析。
-    parent_item 使用完整汇总科目名，如 "Total automotive revenues"。"""
-    rows = table_db.query_children(parent_item)
-    if not rows:
-        return f"未找到 {parent_item} 的构成明细"
-    seen, lines = set(), []
-    for item, year, value, page in rows:
-        if (item, year) not in seen:
-            seen.add((item, year))
-            lines.append(f"{item} | {year}年 | {value:,.0f} | 第{page}页")
-    return "\n".join(lines)
+# ============================================================
+# MCP 客户端：连接 mcp_server.py 子进程
+# ============================================================
+
+_MCP_CLIENT = None
+_ALL_TOOLS = []            # 本地工具 + MCP 工具，连接后填充
 
 
-@tool
-def calculate(expressions: str) -> str:
-    """计算一个或多个数学表达式，用于增长率、占比、差额、复合增长率等。
-    多个表达式用分号 ; 分隔，一次性算完，不要分多次调用。
-    示例："(94827-97690)/97690*100; (12771/6035)**0.5-1"
-    涉及计算时必须调用本工具，不要心算。"""
-    results = []
-    for expr in expressions.split(";"):
-        expr = expr.strip()
-        if not expr:
-            continue
-        if not re.fullmatch(r"[\d\s\.\+\-\*/\(\)eE]+", expr):
-            results.append(f"{expr} → 含非法字符，已跳过")
-            continue
-        try:
-            results.append(f"{expr} = {eval(expr, {'__builtins__': {}}):.4f}")
-        except Exception as e:
-            results.append(f"{expr} → 计算出错：{e}")
-    return "\n".join(results) if results else "未提供有效表达式"
+async def init_mcp():
+    """启动并连接 MCP Server，把其工具转换为 LangChain 工具"""
+    global _MCP_CLIENT, _ALL_TOOLS
+
+    server_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "mcp_server.py")
+    _MCP_CLIENT = MultiServerMCPClient({
+        "financial-data": {
+            "command": sys.executable,       # 用当前虚拟环境的 python
+            "args": [server_path],
+            "transport": "stdio",
+        }
+    })
+
+    mcp_tools = await _MCP_CLIENT.get_tools()   # 连接 + 列工具 + 转换格式
+    _ALL_TOOLS = LOCAL_TOOLS + list(mcp_tools)
+
+    print(f"  [MCP] 已连接 financial-data，获得 {len(mcp_tools)} 个工具："
+          f"{', '.join(t.name for t in mcp_tools)}")
+    return _ALL_TOOLS
 
 
-TOOLS = [search_filings, query_financials, get_breakdown, calculate]
+def get_tools():
+    """当前可用的全部工具；若 MCP 未连接则只有本地工具"""
+    return _ALL_TOOLS or LOCAL_TOOLS
+
+
+async def warmup():
+    """启动时预热：向量库、重排模型、MCP 连接"""
+    _vs()
+    rag_pipeline.get_reranker()
+    await init_mcp()
 
 
 # ============================================================
@@ -139,7 +137,7 @@ PLANNER_PROMPT = """你是财报分析的规划员。你不执行查询，只负
 可用工具：
 - query_financials(item, company)  查某科目多年数值（一次返回多年，无需按年分开查）
 - get_breakdown(parent_item)       查某汇总科目的构成子项
-- calculate(expression)            数学计算
+- calculate(expressions)           数学计算，多个表达式用分号分隔
 - search_filings(query, company)   检索财报原文
 
 判断规则：
@@ -152,12 +150,11 @@ PLAN:
 2. ...
 
 制定计划时注意：
-- 科目名必须用英文，与财报原文一致（如 "Total automotive revenues"、"Total revenues"、
-  "net income"），数据库中没有中文科目名，用中文必然查不到
+- 科目名必须用英文，与财报原文一致（如 "Total automotive revenues"、"net income"），
+  数据库中没有中文科目名，用中文必然查不到
 - 同类数据一次取全，不要分年份或分科目重复调用
-- 查构成用 get_breakdown 即可，它会一次返回所有子项的多年数值，
-  不需要再单独 query_financials 查父项
-- 多个同类计算尽量合并，不要每个数字单独算一次
+- get_breakdown 会一次返回所有子项的多年数值，不需要再单独查父项
+- 多个计算用分号分隔，在一次 calculate 中完成
 - 不要把「整理答案」「归纳总结」写成步骤，那不需要工具
 
 用户问题：{question}"""
@@ -235,11 +232,11 @@ def _parse_json_list(text):
 
 
 # ============================================================
-# 节点
+# 节点（均为异步，因 MCP 工具调用需 await）
 # ============================================================
 
-def load_memory_node(state: AgentState):
-    """按当前问题语义检索相关的长期记忆（而非全量注入）"""
+async def load_memory_node(state: AgentState):
+    """按当前问题语义检索相关的长期记忆"""
     question = next((m.content for m in reversed(state["messages"])
                      if isinstance(m, HumanMessage)), "")
     user_id = state.get("user_id", "default")
@@ -252,14 +249,14 @@ def load_memory_node(state: AgentState):
     return {"memory": memory.format_memories(rows), "plan": ""}
 
 
-def planner_node(state: AgentState):
-    """规划员：判断复杂度，必要时把问题拆解为执行计划"""
+async def planner_node(state: AgentState):
+    """规划员：判断复杂度，必要时拆解为执行计划"""
     question = next((m.content for m in reversed(state["messages"])
                      if isinstance(m, HumanMessage)), "")
     try:
-        verdict = rag_pipeline.get_llm().invoke(
-            [HumanMessage(PLANNER_PROMPT.format(question=question))]
-        ).content.strip()
+        resp = await rag_pipeline.get_llm().ainvoke(
+            [HumanMessage(PLANNER_PROMPT.format(question=question))])
+        verdict = resp.content.strip()
     except Exception as e:
         print(f"  [规划] 规划失败，按简单问题处理：{e}")
         return {"plan": ""}
@@ -274,7 +271,7 @@ def planner_node(state: AgentState):
     return {"plan": plan}
 
 
-def analyst_node(state: AgentState):
+async def analyst_node(state: AgentState):
     """分析员：结合长期记忆与执行计划，调用工具并组织答案"""
     system = ANALYST_PROMPT
     if state.get("memory"):
@@ -284,9 +281,10 @@ def analyst_node(state: AgentState):
     if state.get("plan"):
         system += ("\n\n规划员已为本次问题制定执行计划，请按计划调用工具，"
                    "避免重复或无关的调用：\n" + state["plan"])
-    llm = rag_pipeline.get_llm().bind_tools(TOOLS)
+
+    llm = rag_pipeline.get_llm().bind_tools(get_tools())
     msgs = [SystemMessage(system)] + _recent_turns(state["messages"])
-    return {"messages": [llm.invoke(msgs)]}
+    return {"messages": [await llm.ainvoke(msgs)]}
 
 
 def should_continue(state: AgentState) -> str:
@@ -295,14 +293,14 @@ def should_continue(state: AgentState) -> str:
     return "tools" if getattr(last, "tool_calls", None) else "save_memory"
 
 
-def save_memory_node(state: AgentState):
+async def save_memory_node(state: AgentState):
     """从本轮对话中提取值得长期保存的信息"""
     msgs = state["messages"]
     question = next((m.content for m in reversed(msgs)
                      if isinstance(m, HumanMessage)), "")
     answer = msgs[-1].content if msgs else ""
     try:
-        resp = rag_pipeline.get_llm().invoke(
+        resp = await rag_pipeline.get_llm().ainvoke(
             [HumanMessage(EXTRACT_PROMPT.format(q=question, a=answer[:1500]))])
         items = _parse_json_list(resp.content)
         n = memory.add_many(state.get("user_id", "default"), items)
@@ -314,7 +312,7 @@ def save_memory_node(state: AgentState):
 
 
 # ============================================================
-# 构图
+# 构图（运行时构建：工具列表需连接 MCP 后才确定）
 # ============================================================
 
 def build_graph():
@@ -322,7 +320,7 @@ def build_graph():
     g.add_node("load_memory", load_memory_node)
     g.add_node("planner", planner_node)
     g.add_node("analyst", analyst_node)
-    g.add_node("tools", ToolNode(TOOLS))
+    g.add_node("tools", ToolNode(get_tools()))
     g.add_node("save_memory", save_memory_node)
 
     g.add_edge(START, "load_memory")
@@ -330,10 +328,10 @@ def build_graph():
     g.add_edge("planner", "analyst")
     g.add_conditional_edges("analyst", should_continue,
                             {"tools": "tools", "save_memory": "save_memory"})
-    g.add_edge("tools", "analyst")          # 工具结果回到分析员，形成循环
+    g.add_edge("tools", "analyst")
     g.add_edge("save_memory", END)
 
-    return g.compile(checkpointer=_Saver())   # checkpointer 提供短期记忆
+    return g.compile(checkpointer=_Saver())
 
 
 _GRAPH = None
@@ -342,18 +340,18 @@ _GRAPH = None
 def get_graph():
     global _GRAPH
     if _GRAPH is None:
-        _GRAPH = build_graph()
+        _GRAPH = build_graph()      # 须在 warmup() 之后调用
     return _GRAPH
 
 
-def run_agent(question, user_id="default", thread_id="default", verbose=True):
+async def arun_agent(question, user_id="default", thread_id="default", verbose=True):
     """
-    执行一次问答，返回 (最终回答, 本轮工具调用轨迹)
+    执行一次问答（异步），返回 (最终回答, 本轮工具调用轨迹)
     thread_id：会话标识，同一 thread 内共享短期记忆
     user_id  ：用户标识，决定读写哪个用户的长期记忆
     """
     cfg = {"configurable": {"thread_id": thread_id}, "recursion_limit": 30}
-    result = get_graph().invoke(
+    result = await get_graph().ainvoke(
         {"messages": [HumanMessage(question)], "user_id": user_id}, cfg)
 
     msgs = result["messages"]
