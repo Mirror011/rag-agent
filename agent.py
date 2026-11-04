@@ -1,11 +1,17 @@
-"""基于 LangGraph 的财报分析智能体（含长短期记忆）
+"""基于 LangGraph 的财报分析智能体（规划 + 工具调用 + 长短期记忆）
 
 状态图结构：
-    START → load_memory → analyst ──(有工具调用)──> tools ──> analyst
-                             └──────(无工具调用)──> save_memory → END
+    START → load_memory → planner → analyst ──(请求工具)──> tools ──> analyst
+                                       └──────(给出答案)──> save_memory → END
 
-短期记忆：LangGraph checkpointer，按 thread_id 保存本次会话状态
-长期记忆：向量检索 + SQLite（见 memory.py），按 user_id 跨会话保存
+多智能体分工：
+    planner  规划员，判断问题复杂度；复杂问题拆解为执行计划，避免分析员
+             「走一步看一步」导致的重复与无效工具调用
+    analyst  分析员，按计划调用工具并组织答案
+
+记忆：
+    短期  LangGraph checkpointer，按 thread_id 保存本次会话状态
+    长期  向量检索 + SQLite 双写（见 memory.py），按 user_id 跨会话保存
 """
 import re
 import json
@@ -101,20 +107,60 @@ def get_breakdown(parent_item: str) -> str:
 
 
 @tool
-def calculate(expression: str) -> str:
-    """计算数学表达式，用于增长率、占比、差额、复合增长率等。
-    示例："(94827-97690)/97690*100"、"(12771/6035)**0.5-1"。
+def calculate(expressions: str) -> str:
+    """计算一个或多个数学表达式，用于增长率、占比、差额、复合增长率等。
+    多个表达式用分号 ; 分隔，一次性算完，不要分多次调用。
+    示例："(94827-97690)/97690*100; (12771/6035)**0.5-1"
     涉及计算时必须调用本工具，不要心算。"""
-    if not re.fullmatch(r"[\d\s\.\+\-\*/\(\)eE]+", expression):
-        return "表达式包含非法字符，仅允许数字与 + - * / ( ) **"
-    try:
-        value = eval(expression, {"__builtins__": {}})
-        return f"{expression} = {value:.4f}"
-    except Exception as e:
-        return f"计算出错：{e}"
+    results = []
+    for expr in expressions.split(";"):
+        expr = expr.strip()
+        if not expr:
+            continue
+        if not re.fullmatch(r"[\d\s\.\+\-\*/\(\)eE]+", expr):
+            results.append(f"{expr} → 含非法字符，已跳过")
+            continue
+        try:
+            results.append(f"{expr} = {eval(expr, {'__builtins__': {}}):.4f}")
+        except Exception as e:
+            results.append(f"{expr} → 计算出错：{e}")
+    return "\n".join(results) if results else "未提供有效表达式"
 
 
 TOOLS = [search_filings, query_financials, get_breakdown, calculate]
+
+
+# ============================================================
+# 提示词
+# ============================================================
+
+PLANNER_PROMPT = """你是财报分析的规划员。你不执行查询，只负责判断问题复杂度并在必要时给出执行计划。
+
+可用工具：
+- query_financials(item, company)  查某科目多年数值（一次返回多年，无需按年分开查）
+- get_breakdown(parent_item)       查某汇总科目的构成子项
+- calculate(expression)            数学计算
+- search_filings(query, company)   检索财报原文
+
+判断规则：
+- 若问题一步即可回答（查单个数值、查某段文字、用户只是陈述偏好），输出：SIMPLE
+- 若问题需要多步（跨公司对比、构成分析、多指标计算、趋势判断），输出执行计划
+
+计划格式（不超过 5 步，每步一行）：
+PLAN:
+1. <动作> —— 用 <工具名>
+2. ...
+
+制定计划时注意：
+- 科目名必须用英文，与财报原文一致（如 "Total automotive revenues"、"Total revenues"、
+  "net income"），数据库中没有中文科目名，用中文必然查不到
+- 同类数据一次取全，不要分年份或分科目重复调用
+- 查构成用 get_breakdown 即可，它会一次返回所有子项的多年数值，
+  不需要再单独 query_financials 查父项
+- 多个同类计算尽量合并，不要每个数字单独算一次
+- 不要把「整理答案」「归纳总结」写成步骤，那不需要工具
+
+用户问题：{question}"""
 
 ANALYST_PROMPT = """你是一个财报分析智能体，可查询特斯拉（Tesla）与苹果（Apple）的 10-K 年报。
 
@@ -129,8 +175,11 @@ B. 查询财报信息——按下面的原则调用工具作答。
 3. 分析构成、占比、贡献度时使用 get_breakdown
 4. 风险、业务描述等文字类问题使用 search_filings
 5. 回答末尾标注数据来源（公司、章节、页码）
-6. 工具查不到的内容如实说明，不要编造
-7. 只回答用户当前问的问题，不要主动重复或扩展上一轮的内容"""
+6. 工具查不到的内容如实说明，不要编造，也不要给出估算值
+7. 只回答用户当前问的问题，不要主动重复或扩展上一轮的内容
+8. 避免重复调用工具：科目名一律用英文；同一科目多年数据一次取全；
+   get_breakdown 已返回子项全部年份数值，不必再逐项查询；
+   多个计算用分号分隔在一次 calculate 中完成"""
 
 EXTRACT_PROMPT = """请从下面这轮对话中，提取值得长期记住、对今后对话有帮助的信息。
 
@@ -157,8 +206,9 @@ EXTRACT_PROMPT = """请从下面这轮对话中，提取值得长期记住、对
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]   # 短期记忆（由 checkpointer 持久化）
-    memory: str                               # 本轮检索到的长期记忆文本
+    memory: str                               # 本轮检索到的长期记忆
     user_id: str
+    plan: str                                 # 本轮执行计划（简单问题为空串）
 
 
 # ============================================================
@@ -190,8 +240,7 @@ def _parse_json_list(text):
 
 def load_memory_node(state: AgentState):
     """按当前问题语义检索相关的长期记忆（而非全量注入）"""
-    msgs = state["messages"]
-    question = next((m.content for m in reversed(msgs)
+    question = next((m.content for m in reversed(state["messages"])
                      if isinstance(m, HumanMessage)), "")
     user_id = state.get("user_id", "default")
 
@@ -200,16 +249,41 @@ def load_memory_node(state: AgentState):
         shown = ", ".join(f"{r[2]:.2f}" for r in rows if r[2] is not None)
         print(f"  [记忆] 从 {memory.count(user_id)} 条中检索到 {len(rows)} 条相关"
               + (f"（相关度 {shown}）" if shown else ""))
-    return {"memory": memory.format_memories(rows)}
+    return {"memory": memory.format_memories(rows), "plan": ""}
+
+
+def planner_node(state: AgentState):
+    """规划员：判断复杂度，必要时把问题拆解为执行计划"""
+    question = next((m.content for m in reversed(state["messages"])
+                     if isinstance(m, HumanMessage)), "")
+    try:
+        verdict = rag_pipeline.get_llm().invoke(
+            [HumanMessage(PLANNER_PROMPT.format(question=question))]
+        ).content.strip()
+    except Exception as e:
+        print(f"  [规划] 规划失败，按简单问题处理：{e}")
+        return {"plan": ""}
+
+    if verdict.upper().startswith("SIMPLE") or "PLAN:" not in verdict.upper():
+        print("  [规划] 简单问题，直接执行")
+        return {"plan": ""}
+
+    plan = verdict[verdict.upper().index("PLAN:"):]
+    steps = len([ln for ln in plan.splitlines() if re.match(r"\s*\d+[\.、]", ln)])
+    print(f"  [规划] 生成 {steps} 步执行计划")
+    return {"plan": plan}
 
 
 def analyst_node(state: AgentState):
-    """分析员：结合长期记忆与近期对话，决定调用工具还是作答"""
+    """分析员：结合长期记忆与执行计划，调用工具并组织答案"""
     system = ANALYST_PROMPT
     if state.get("memory"):
         system += ("\n\n" + state["memory"] +
                    "\n\n请结合以上记忆理解用户的关注点与偏好；"
                    "但历史结论只作参考，涉及数字时仍须通过工具重新核实。")
+    if state.get("plan"):
+        system += ("\n\n规划员已为本次问题制定执行计划，请按计划调用工具，"
+                   "避免重复或无关的调用：\n" + state["plan"])
     llm = rag_pipeline.get_llm().bind_tools(TOOLS)
     msgs = [SystemMessage(system)] + _recent_turns(state["messages"])
     return {"messages": [llm.invoke(msgs)]}
@@ -246,12 +320,14 @@ def save_memory_node(state: AgentState):
 def build_graph():
     g = StateGraph(AgentState)
     g.add_node("load_memory", load_memory_node)
+    g.add_node("planner", planner_node)
     g.add_node("analyst", analyst_node)
     g.add_node("tools", ToolNode(TOOLS))
     g.add_node("save_memory", save_memory_node)
 
     g.add_edge(START, "load_memory")
-    g.add_edge("load_memory", "analyst")
+    g.add_edge("load_memory", "planner")
+    g.add_edge("planner", "analyst")
     g.add_conditional_edges("analyst", should_continue,
                             {"tools": "tools", "save_memory": "save_memory"})
     g.add_edge("tools", "analyst")          # 工具结果回到分析员，形成循环
@@ -276,7 +352,7 @@ def run_agent(question, user_id="default", thread_id="default", verbose=True):
     thread_id：会话标识，同一 thread 内共享短期记忆
     user_id  ：用户标识，决定读写哪个用户的长期记忆
     """
-    cfg = {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
+    cfg = {"configurable": {"thread_id": thread_id}, "recursion_limit": 30}
     result = get_graph().invoke(
         {"messages": [HumanMessage(question)], "user_id": user_id}, cfg)
 
@@ -288,4 +364,6 @@ def run_agent(question, user_id="default", thread_id="default", verbose=True):
             trace.append({"tool": call["name"], "args": call["args"]})
             if verbose:
                 print(f"  → 调用 {call['name']}({call['args']})")
+    if verbose and trace:
+        print(f"  [统计] 本轮共调用工具 {len(trace)} 次")
     return msgs[-1].content, trace
