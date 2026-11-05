@@ -22,6 +22,23 @@ def _to_number(s):
     v = float(s)
     return -v if neg else v
 
+def _filter_by_magnitude(nums, max_ratio=100):
+    """剔除与主数值量级悬殊的项（通常是夹在年份列之间的变动百分比）。
+
+    财报表格存在两种排版：
+        Tesla   2025 | 2024 | 2023 | 变动额 | 变动%      变动列在末尾
+        Apple   2025 | 6 | 391,035 | 2 | 383,285        变动%夹在年份之间
+    后者会使年份与数值错位。同一行的年度数值量级相近，
+    故以首个数值为基准，剔除小于其 1/100 的项。
+    """
+    if len(nums) < 2:
+        return nums
+    base = abs(nums[0])
+    if base == 0:
+        return nums
+    kept = [n for n in nums if abs(n) == 0 or abs(n) >= base / max_ratio]
+    return kept if len(kept) >= 2 else nums      # 过滤过度则放弃，保留原值
+
 
 def _detect_years(page_text):
     """识别页面上的年份序列（财报通常列三年）"""
@@ -89,6 +106,7 @@ def build_db(db_path=None):
                     item = " ".join(item.split())  # 顺手修复换行截断
                     nums = [_to_number(c) for c in cells[1:]]
                     nums = [n for n in nums if n is not None]
+                    nums = _filter_by_magnitude(nums)  # 剔除夹在年份间的百分比
                     if not nums:
                         continue
                     for i, year in enumerate(years):

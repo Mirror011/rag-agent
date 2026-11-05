@@ -1,15 +1,17 @@
-"""基于 LangGraph 的财报分析智能体（MCP 工具 + 规划 + 长短期记忆）
+"""基于 LangGraph 的财报分析智能体（Skill + MCP 工具 + 规划 + 长短期记忆）
 
 状态图：
     START → load_memory → planner → analyst ──(请求工具)──> tools ──> analyst
                                        └──────(给出答案)──> save_memory → END
 
 工具来源（混合架构）：
-    本地工具  search_filings —— 依赖 bge-m3 与重排模型（约 2GB），
-                               若拆入子进程需重复加载，故保留在 Agent 进程内
+    本地工具  search_filings —— 依赖 bge-m3 与重排模型（约 2GB），拆入子进程需重复加载
+              load_skill     —— 按需读取 Skill 正文（渐进式披露的第二层）
     MCP 工具  query_financials / get_breakdown / calculate
-                            —— 由 mcp_server.py 子进程提供，经 stdio 通信，
-                               可被任何 MCP 客户端复用
+                            —— 由 mcp_server.py 子进程提供，经 stdio 通信
+
+Skill：
+    skills/<name>/SKILL.md，目录（名称+描述）常驻提示词，正文经 load_skill 按需加载
 
 多智能体：
     planner  判断问题复杂度，复杂问题拆解为执行计划
@@ -41,6 +43,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 import rag_pipeline
 import memory
+import skills
 import config
 
 # ============================================================
@@ -61,7 +64,7 @@ def _vs():
 
 
 # ============================================================
-# 本地工具（依赖重模型，不走 MCP）
+# 本地工具
 # ============================================================
 
 @tool
@@ -83,7 +86,18 @@ def search_filings(query: str, company: str = "") -> str:
     return "\n\n".join(out)
 
 
-LOCAL_TOOLS = [search_filings]
+@tool
+def load_skill(name: str) -> str:
+    """加载某个 Skill 的完整分析方法。当问题属于某个 Skill 的适用范围时，
+    先调用本工具获取方法，再按方法执行。name 为 Skill 名称，如 "profitability-analysis"。"""
+    body = skills.load(name)
+    if body is None:
+        return f"不存在名为 {name} 的 Skill。可用：{', '.join(skills.names())}"
+    print(f"  [Skill] 已加载 {name}（{len(body)} 字）")
+    return body
+
+
+LOCAL_TOOLS = [search_filings, load_skill]
 
 
 # ============================================================
@@ -122,9 +136,10 @@ def get_tools():
 
 
 async def warmup():
-    """启动时预热：向量库、重排模型、MCP 连接"""
+    """启动时预热：向量库、重排模型、Skill 目录、MCP 连接"""
     _vs()
     rag_pipeline.get_reranker()
+    print(f"  [Skill] 发现 {len(skills.names())} 个：{', '.join(skills.names())}")
     await init_mcp()
 
 
@@ -135,14 +150,17 @@ async def warmup():
 PLANNER_PROMPT = """你是财报分析的规划员。你不执行查询，只负责判断问题复杂度并在必要时给出执行计划。
 
 可用工具：
+- load_skill(name)                 加载某个分析方法（Skill）的完整说明
 - query_financials(item, company)  查某科目多年数值（一次返回多年，无需按年分开查）
 - get_breakdown(parent_item)       查某汇总科目的构成子项
 - calculate(expressions)           数学计算，多个表达式用分号分隔
 - search_filings(query, company)   检索财报原文
 
+{skill_catalog}
+
 判断规则：
 - 若问题一步即可回答（查单个数值、查某段文字、用户只是陈述偏好），输出：SIMPLE
-- 若问题需要多步（跨公司对比、构成分析、多指标计算、趋势判断），输出执行计划
+- 若问题需要多步（跨公司对比、盈利分析、构成分析、趋势判断），输出执行计划
 
 计划格式（不超过 5 步，每步一行）：
 PLAN:
@@ -150,10 +168,9 @@ PLAN:
 2. ...
 
 制定计划时注意：
-- 科目名必须用英文，与财报原文一致（如 "Total automotive revenues"、"net income"），
-  数据库中没有中文科目名，用中文必然查不到
+- 若问题属于某个 Skill 的适用范围，第一步写"加载 Skill <名称> —— 用 load_skill"
+- 科目名必须用英文，与财报原文一致，数据库中没有中文科目名
 - 同类数据一次取全，不要分年份或分科目重复调用
-- get_breakdown 会一次返回所有子项的多年数值，不需要再单独查父项
 - 多个计算用分号分隔，在一次 calculate 中完成
 - 不要把「整理答案」「归纳总结」写成步骤，那不需要工具
 
@@ -167,15 +184,16 @@ A. 陈述偏好或背景（如"我关注能源业务""回答简洁点"）——�
 B. 查询财报信息——按下面的原则调用工具作答。
 
 查询类问题的工作原则：
-1. 数字类问题必须调用 query_financials 获取精确数值，不得凭记忆作答
-2. 任何计算（增长率、占比、CAGR）必须调用 calculate，不要心算
-3. 分析构成、占比、贡献度时使用 get_breakdown
-4. 风险、业务描述等文字类问题使用 search_filings
-5. 回答末尾标注数据来源（公司、章节、页码）
-6. 工具查不到的内容如实说明，不要编造，也不要给出估算值
-7. 只回答用户当前问的问题，不要主动重复或扩展上一轮的内容
-8. 避免重复调用工具：科目名一律用英文；同一科目多年数据一次取全；
-   get_breakdown 已返回子项全部年份数值，不必再逐项查询；
+1. 若问题属于下方某个 Skill 的适用范围，先调用 load_skill 加载方法，再严格按方法执行；
+   一个问题可以同时加载多个 Skill
+2. 数字类问题必须调用 query_financials 获取精确数值，不得凭记忆作答
+3. 任何计算（增长率、占比、利润率）必须调用 calculate，不要心算
+4. 分析构成、贡献度时使用 get_breakdown
+5. 风险、业务描述等文字类问题使用 search_filings
+6. 回答末尾标注数据来源（公司、章节、页码）
+7. 工具查不到的内容如实说明，不要编造，也不要给出估算值
+8. 只回答用户当前问的问题，不要主动重复或扩展上一轮的内容
+9. 避免重复调用工具：科目名一律用英文；同一科目多年数据一次取全；
    多个计算用分号分隔在一次 calculate 中完成"""
 
 EXTRACT_PROMPT = """请从下面这轮对话中，提取值得长期记住、对今后对话有帮助的信息。
@@ -254,8 +272,9 @@ async def planner_node(state: AgentState):
     question = next((m.content for m in reversed(state["messages"])
                      if isinstance(m, HumanMessage)), "")
     try:
-        resp = await rag_pipeline.get_llm().ainvoke(
-            [HumanMessage(PLANNER_PROMPT.format(question=question))])
+        resp = await rag_pipeline.get_llm().ainvoke([HumanMessage(
+            PLANNER_PROMPT.format(question=question,
+                                  skill_catalog=skills.catalog_text()))])
         verdict = resp.content.strip()
     except Exception as e:
         print(f"  [规划] 规划失败，按简单问题处理：{e}")
@@ -272,8 +291,13 @@ async def planner_node(state: AgentState):
 
 
 async def analyst_node(state: AgentState):
-    """分析员：结合长期记忆与执行计划，调用工具并组织答案"""
+    """分析员：结合 Skill 目录、长期记忆与执行计划，调用工具并组织答案"""
     system = ANALYST_PROMPT
+
+    catalog = skills.catalog_text()            # 第一层：Skill 目录常驻
+    if catalog:
+        system += "\n\n" + catalog
+
     if state.get("memory"):
         system += ("\n\n" + state["memory"] +
                    "\n\n请结合以上记忆理解用户的关注点与偏好；"
